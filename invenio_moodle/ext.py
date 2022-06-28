@@ -26,5 +26,8 @@ class InvenioMoodle:
     def init_config(self, app):
         """Initialize configuration."""
         for k in dir(config):
-            if k.startswith("INVENIO_MOODLE_"):
+            if k.startswith("MOODLE_"):
                 app.config.setdefault(k, getattr(config, k))
+            if k == "MOODLE_CELERY_BEAT_SCHEDULE":
+                app.config.setdefault("CELERY_BEAT_SCHEDULE", {})
+                app.config["CELERY_BEAT_SCHEDULE"].update(getattr(config, k))
