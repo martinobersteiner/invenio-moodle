@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import html
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import partial
 
@@ -25,7 +26,16 @@ from .schemas import MoodleSchema
 
 
 @dataclass(frozen=True)
-class CourseKey:
+class Key(ABC):
+    """Common ancestor to all SomethingKey classes."""
+
+    @abstractmethod
+    def to_string_key(self):
+        """Convert `self` to unique string representation."""
+
+
+@dataclass(frozen=True)
+class CourseKey(Key):
     """Key for courses as to disambiguate it from keys for units and files."""
 
     courseid: str
@@ -42,7 +52,7 @@ class CourseKey:
 
 
 @dataclass(frozen=True)
-class UnitKey:
+class UnitKey(Key):
     """Key for units as to disambiguate it from keys for courses and files."""
 
     courseid: str
@@ -63,7 +73,7 @@ class UnitKey:
 
 
 @dataclass
-class Item:  # TODO: rename
+class TaskInfo:
     """Stores data."""
 
     pid: str
@@ -73,31 +83,40 @@ class Item:  # TODO: rename
     moodle_course_json: dict = None
 
 
-def fetch_or_create(database_key, resource_type):
+def fetch_else_create(database_key, resource_type):
     """Fetch moodle-result corresponding to `database_key`, create database-entry if none exists."""
     service = current_records_lom.records_service
-    create = partial(service.create, system_identity=system_identity)
-    read_latest = partial(service.read_latest, system_identity=system_identity)
+    create = partial(service.create, identity=system_identity)
+    read = partial(service.read, identity=system_identity)
 
     try:
-        pid = PersistentIdentifier.get(pid_type="moodle", pid_value=database_key)
+        moodle_pid = PersistentIdentifier.get(pid_type="moodle", pid_value=database_key)
     except PIDDoesNotExistError:
-        # TODO: configure PIDProviders s.t. moodle-id is added to database
-        # create with empty metadata
-        data = LOMMetadata.create(resource_type=resource_type).json
-        draft_item = create(data=data)
+        # create draft with empty metadata
+        pids_dict = {"moodle": {"provider": "moodle", "identifier": database_key}}
+        metadata = LOMMetadata.create(resource_type=resource_type, pids=pids_dict)
+        metadata.append_identifier(database_key, catalog="moodle")
+        draft_item = create(data=metadata.json)
 
-        pid = draft_item.id
+        pid: str = draft_item.id
         previous_json = None
         json_ = draft_item.to_dict()
     else:
-        previous_json = read_latest(pid).to_dict()
+        # get lomid corresponding to moodle_pid
+        lomid_pid = PersistentIdentifier.get_by_object(
+            pid_type="lomid",
+            object_type=moodle_pid.object_type,
+            object_uuid=moodle_pid.object_uuid,
+        )
+
+        pid: str = lomid_pid.pid_value
+        previous_json = read(id_=pid).to_dict()
         json_ = copy.deepcopy(previous_json)
 
-    return Item(pid=pid, previous_json=previous_json, json=json_)
+    return TaskInfo(pid=pid, previous_json=previous_json, json=json_)
 
 
-def link(whole: Item, part: Item):
+def link_up(whole: TaskInfo, part: TaskInfo):
     """If unlinked, link jsons within `whole`, `part`."""
     whole_metadata = LOMMetadata(whole.json)
     part_metadata = LOMMetadata(part.json)
@@ -109,9 +128,9 @@ def link(whole: Item, part: Item):
     part.json = part_metadata.json
 
 
-def update_course_metadata(course_item: Item):
+def update_course_metadata(course_item: TaskInfo):
     """Convert moodle-style file-json to LOM json."""
-    metadata = LOMMetadata(course_item.json or {})
+    metadata = LOMMetadata(course_item.json or {}, overwritable=True)
     file_json = course_item.moodle_file_json
     course_json = course_item.moodle_course_json
 
@@ -140,9 +159,9 @@ def update_course_metadata(course_item: Item):
     course_item.json = metadata.json
 
 
-def update_unit_metadata(unit_item: Item):
+def update_unit_metadata(unit_item: TaskInfo):
     """Convert moodle-style file-json to LOM json."""
-    metadata = LOMMetadata(unit_item.json or {})
+    metadata = LOMMetadata(unit_item.json or {}, overwritable=True)
     file_json = unit_item.moodle_file_json
     course_json = unit_item.moodle_course_json
 
@@ -195,50 +214,53 @@ def insert_moodle_into_db(moodle_data: dict):
         whose format matches `MoodleSchema`
     """
     # TODO: refactor: split up this function
+    # TODO: link with previous course
 
     # validate input
     moodle_data = MoodleSchema().load(moodle_data)
 
-    # prepare: gather necessary information, create records if no previous versions exist
-    cache: dict[UnitKey | CourseKey, Item] = {}  # TODO: rename
-    links: set[tuple[CourseKey, UnitKey]] = set()
+    # initialize
+    tasks: dict[Key, TaskInfo] = {}  # keeps track of one task per course/unit/file
+    links: set[tuple[Key, Key]] = set()  # {(course_key, "haspart", unit_key), ...}
     moodle_file_jsons = [
         file_json
         for moodlecourse in moodle_data["moodlecourses"]
         for file_json in moodlecourse["files"]
     ]
+
+    # prepare: gather necessary information, create records if no previous versions exist
     for moodle_file_json in moodle_file_jsons:
         # TODO: add fetching of files here (in a later PR)
         for moodle_course_json in moodle_file_json["courses"]:
             unit_key = UnitKey.from_json(moodle_file_json, moodle_course_json)
             course_key = CourseKey.from_json(moodle_course_json)
 
-            if unit_key not in cache:
-                unit_item = fetch_or_create(
+            if unit_key not in tasks:
+                unit_item = fetch_else_create(
                     unit_key.to_string_key(),
                     resource_type="unit",
                 )
                 unit_item.moodle_file_json = moodle_file_json
                 unit_item.moodle_course_json = moodle_course_json
-                cache[unit_key] = unit_item
+                tasks[unit_key] = unit_item
 
-            if course_key not in cache:
-                course_item = fetch_or_create(
+            if course_key not in tasks:
+                course_item = fetch_else_create(
                     course_key.to_string_key(),
                     resource_type="course",
                 )
                 course_item.moodle_file_json = moodle_file_json
                 course_item.moodle_course_json = moodle_course_json
-                cache[course_key] = course_item
+                tasks[course_key] = course_item
 
             links.add((course_key, unit_key))
 
     # link records
     for whole_key, part_key in links:
-        link(cache[whole_key], cache[part_key])
+        link_up(tasks[whole_key], tasks[part_key])
 
     # update lom-jsons with info from moodle
-    for key, item in cache.items():
+    for key, item in tasks.items():
         if isinstance(key, UnitKey):
             update_unit_metadata(item)
         elif isinstance(key, CourseKey):
@@ -248,9 +270,9 @@ def insert_moodle_into_db(moodle_data: dict):
 
     # update drafts
     service = current_records_lom.records_service
-    edit = partial(service, identity=system_identity)
-    update_draft = partial(service, identity=system_identity)
-    for item in cache.values():
+    edit = partial(service.edit, identity=system_identity)
+    update_draft = partial(service.update_draft, identity=system_identity)
+    for item in tasks.values():
         if item.previous_json != item.json:
             # json got updated, now update database with new json
             edit(id_=item.pid)  # ensure a draft exists
@@ -258,8 +280,10 @@ def insert_moodle_into_db(moodle_data: dict):
 
     # publish created drafts
     # uow rolls back all `.publish`s if one fails as to prevent an inconsistent database-state
-    publish = partial(service, identity=system_identity)
+    publish = partial(service.publish, identity=system_identity)
     with UnitOfWork() as uow:
-        for item in cache.values():
+        for item in tasks.values():
             if item.previous_json != item.json:
-                publish(item.pid, uow=uow)
+                publish(id_=item.pid, uow=uow)
+
+        uow.commit()
